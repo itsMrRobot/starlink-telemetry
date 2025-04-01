@@ -1,0 +1,7 @@
+services:
+  starlink-telemetry:
+    build: .\Docker
+    container_name: starlink-telemetry
+    restart: always
+    env_file:
+      - .env  # Config here
