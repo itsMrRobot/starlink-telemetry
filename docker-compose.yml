@@ -1,6 +1,6 @@
 services:
   starlink-telemetry:
-    build: .\Docker
+    image: keithflannery/starlink-telemetry:latest
     container_name: starlink-telemetry
     restart: always
     env_file:
