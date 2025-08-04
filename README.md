@@ -8,4 +8,5 @@ INFLUXDB_URL=http://influxdb:8086
 INFLUXDB_TOKEN=influx token
 INFLUXDB_ORG=influx org
 INFLUXDB_BUCKET=starlink
+INFLUXDB_BUCKET=alert_type
 ```
