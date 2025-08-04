@@ -123,7 +123,7 @@ def write_alerts_to_influx(values_alerts, write_api):
                 .tag("device_type", device_type)
                 .tag("code", code)
                 .field("alert_name", name)
-                .time(datetime.datetime.utcnow(), WritePrecision.S)
+                .time(datetime.datetime.now(datetime.UTC), WritePrecision.S)
             )
             write_api.write(bucket=INFLUXDB_BUCKET_2, org=INFLUXDB_ORG, record=point)
         logging.info(f"Wrote {len(alerts)} '{device_type}' alert types to InfluxDB.")
