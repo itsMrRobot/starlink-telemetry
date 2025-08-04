@@ -4,6 +4,7 @@ import requests
 import logging
 import sys
 import h3
+from pprint import pprint
 from dotenv import load_dotenv
 from influxdb_client import InfluxDBClient, Point, WritePrecision
 from influxdb_client.client.write_api import SYNCHRONOUS
@@ -27,6 +28,11 @@ INFLUXDB_TOKEN = os.getenv('INFLUXDB_TOKEN')
 INFLUXDB_ORG = os.getenv('INFLUXDB_ORG')
 INFLUXDB_BUCKET = os.getenv('INFLUXDB_BUCKET')
 INFLUXDB_BUCKET_2 = os.getenv('INFLUXDB_BUCKET_2')
+
+required_vars = ['CLIENT_ID', 'CLIENT_SECRET', 'ACCOUNT_NUMBER', 'INFLUXDB_URL', 'INFLUXDB_TOKEN', 'INFLUXDB_ORG', 'INFLUXDB_BUCKET', 'INFLUXDB_BUCKET_2']
+for var in required_vars:
+    if not os.getenv(var):
+        raise RuntimeError(f"Missing required environment variable: {var}")
 
 def get_starlink_access_token():
     response = requests.post(
@@ -103,7 +109,7 @@ def write_telemetry_to_influx(values, column_names, write_api):
             continue
 
         point = Point(f'starlink_{device_type}') \
-            .time(datetime.datetime.now(datetime.UTC), WritePrecision.S)
+            .time(datetime.datetime.now(datetime.timezone.utc), WritePrecision.S)
 
         # Add fields
         for key, val in fields.items():
@@ -115,18 +121,17 @@ def write_telemetry_to_influx(values, column_names, write_api):
 
         write_api.write(bucket=INFLUXDB_BUCKET, org=INFLUXDB_ORG, record=point)
 
-def write_alerts_to_influx(values_alerts, write_api):
-    for device_type, alerts in values_alerts.items():
-        for code, name in alerts.items():
+def write_alerts_to_influx(alerts_by_device, write_api):
+    for device_type, alerts_dict in alerts_by_device.items():
+        for code, name in alerts_dict.items():
             point = (
                 Point("device_alert")
                 .tag("device_type", device_type)
                 .tag("code", code)
                 .field("alert_name", name)
-                .time(datetime.datetime.now(datetime.UTC), WritePrecision.S)
+                .time(datetime.datetime.now(datetime.timezone.utc), WritePrecision.S)
             )
             write_api.write(bucket=INFLUXDB_BUCKET_2, org=INFLUXDB_ORG, record=point)
-        logging.info(f"Wrote {len(alerts)} '{device_type}' alert types to InfluxDB.")
 
 def main():
     access_token = get_starlink_access_token()
@@ -152,12 +157,16 @@ def main():
             data = response.json().get('data', {})
             values = data.get('values', [])
             column_names = data.get('columnNamesByDeviceType', {})
-            alert_names = data.get('AlertsByDeviceType', {})
+
+            metadata = response.json().get('metadata', {})
+            enums = metadata.get('enums', {})
+            alerts_by_device = enums.get('AlertsByDeviceType', {})
 
             if values:
                 write_telemetry_to_influx(values, column_names, write_api)
                 logging.info(f"Wrote {len(values)} telemetry points to InfluxDB.")
-                write_alerts_to_influx(alert_names, write_api)
+                write_alerts_to_influx(alerts_by_device, write_api)
+                logging.info(f"Wrote {len(alerts_by_device)} alert types to InfluxDB.")
             else:
                 logging.info("No new telemetry data.")
 
