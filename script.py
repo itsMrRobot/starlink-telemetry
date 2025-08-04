@@ -26,6 +26,7 @@ INFLUXDB_URL = os.getenv('INFLUXDB_URL')
 INFLUXDB_TOKEN = os.getenv('INFLUXDB_TOKEN')
 INFLUXDB_ORG = os.getenv('INFLUXDB_ORG')
 INFLUXDB_BUCKET = os.getenv('INFLUXDB_BUCKET')
+INFLUXDB_BUCKET_2 = os.getenv('INFLUXDB_BUCKET_2')
 
 def get_starlink_access_token():
     response = requests.post(
@@ -114,6 +115,19 @@ def write_telemetry_to_influx(values, column_names, write_api):
 
         write_api.write(bucket=INFLUXDB_BUCKET, org=INFLUXDB_ORG, record=point)
 
+def write_alerts_to_influx(values_alerts, write_api):
+    for device_type, alerts in values_alerts.items():
+        for code, name in alerts.items():
+            point = (
+                Point("device_alert")
+                .tag("device_type", device_type)
+                .tag("code", code)
+                .field("alert_name", name)
+                .time(datetime.datetime.utcnow(), WritePrecision.S)
+            )
+            write_api.write(bucket=INFLUXDB_BUCKET_2, org=INFLUXDB_ORG, record=point)
+        logging.info(f"Wrote {len(alerts)} '{device_type}' alert types to InfluxDB.")
+
 def main():
     access_token = get_starlink_access_token()
     influx_client = InfluxDBClient(url=INFLUXDB_URL, token=INFLUXDB_TOKEN, org=INFLUXDB_ORG)
@@ -138,10 +152,12 @@ def main():
             data = response.json().get('data', {})
             values = data.get('values', [])
             column_names = data.get('columnNamesByDeviceType', {})
+            alert_names = data.get('AlertsByDeviceType', {})
 
             if values:
                 write_telemetry_to_influx(values, column_names, write_api)
                 logging.info(f"Wrote {len(values)} telemetry points to InfluxDB.")
+                write_alerts_to_influx(alert_names, write_api)
             else:
                 logging.info("No new telemetry data.")
 
