@@ -29,7 +29,10 @@ INFLUXDB_ORG = os.getenv('INFLUXDB_ORG')
 INFLUXDB_BUCKET = os.getenv('INFLUXDB_BUCKET')
 INFLUXDB_BUCKET_2 = os.getenv('INFLUXDB_BUCKET_2')
 
-required_vars = ['CLIENT_ID', 'CLIENT_SECRET', 'ACCOUNT_NUMBER', 'INFLUXDB_URL', 'INFLUXDB_TOKEN', 'INFLUXDB_ORG', 'INFLUXDB_BUCKET', 'INFLUXDB_BUCKET_2']
+BATCH_SIZE = os.getenv('BATCH_SIZE')
+MAX_LINGER = os.getenv('MAX_LINGER')
+
+required_vars = ['CLIENT_ID', 'CLIENT_SECRET', 'ACCOUNT_NUMBER', 'INFLUXDB_URL', 'INFLUXDB_TOKEN', 'INFLUXDB_ORG', 'INFLUXDB_BUCKET', 'INFLUXDB_BUCKET_2', 'BATCH_SIZE', 'MAX_LINGER']
 for var in required_vars:
     if not os.getenv(var):
         raise RuntimeError(f"Missing required environment variable: {var}")
@@ -51,8 +54,8 @@ def poll_starlink_telemetry(access_token):
         'https://web-api.starlink.com/telemetry/stream/v1/telemetry',
         json={
             "accountNumber": ACCOUNT_NUMBER,
-            "batchSize": 1000,
-            "maxLingerMs": 15000
+            "batchSize": BATCH_SIZE,
+            "maxLingerMs": MAX_LINGER
         },
         headers={
             'Authorization': f'Bearer {access_token}',
