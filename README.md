@@ -78,3 +78,4 @@ Notes
 -----
 - The script refreshes the token automatically on HTTP 401 responses.
 - Influx points are written with current UTC time; adjust inside `script.py` if you need to use API timestamps instead.
+- For additional details on the Starlink Enterprise API, see the docs: https://starlink.readme.io/docs/getting-started
