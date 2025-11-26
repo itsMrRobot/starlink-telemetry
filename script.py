@@ -23,6 +23,8 @@ CLIENT_ID = os.getenv('CLIENT_ID')
 CLIENT_SECRET = os.getenv('CLIENT_SECRET')
 ACCOUNT_NUMBER = os.getenv('ACCOUNT_NUMBER')
 
+STARLINK_BASE_URL = "https://starlink.com/api/public"
+
 INFLUXDB_URL = os.getenv('INFLUXDB_URL')
 INFLUXDB_TOKEN = os.getenv('INFLUXDB_TOKEN')
 INFLUXDB_ORG = os.getenv('INFLUXDB_ORG')
@@ -39,7 +41,7 @@ for var in required_vars:
 
 def get_starlink_access_token():
     response = requests.post(
-        'https://api.starlink.com/auth/connect/token',
+        f"{STARLINK_BASE_URL}/auth/connect/token",
         data={
             'client_id': CLIENT_ID,
             'client_secret': CLIENT_SECRET,
@@ -51,7 +53,7 @@ def get_starlink_access_token():
 
 def poll_starlink_telemetry(access_token):
     response = requests.post(
-        'https://web-api.starlink.com/telemetry/stream/v1/telemetry',
+        f"{STARLINK_BASE_URL}/v2/telemetry/stream",
         json={
             "accountNumber": ACCOUNT_NUMBER,
             "batchSize": BATCH_SIZE,

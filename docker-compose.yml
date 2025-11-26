@@ -1,6 +1,6 @@
 services:
   starlink-telemetry:
-    image: keithflannery/starlink-telemetry:latest
+    image: itsmrrobot/starlink-telemetry:latest
     container_name: starlink-telemetry
     restart: always
     env_file:
