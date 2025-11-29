@@ -1,187 +1,273 @@
-import os
-import time
 import requests
-import logging
-import sys
-import h3
-from pprint import pprint
+import os
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from dotenv import load_dotenv
-from influxdb_client import InfluxDBClient, Point, WritePrecision
-from influxdb_client.client.write_api import SYNCHRONOUS
-import datetime
 
 load_dotenv()
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler(sys.stdout)]
-)
-
 CLIENT_ID = os.getenv('CLIENT_ID')
 CLIENT_SECRET = os.getenv('CLIENT_SECRET')
-ACCOUNT_NUMBER = os.getenv('ACCOUNT_NUMBER')
-
-STARLINK_BASE_URL = "https://starlink.com/api/public"
-
-INFLUXDB_URL = os.getenv('INFLUXDB_URL')
-INFLUXDB_TOKEN = os.getenv('INFLUXDB_TOKEN')
-INFLUXDB_ORG = os.getenv('INFLUXDB_ORG')
-INFLUXDB_BUCKET = os.getenv('INFLUXDB_BUCKET')
-INFLUXDB_BUCKET_2 = os.getenv('INFLUXDB_BUCKET_2')
 
 BATCH_SIZE = os.getenv('BATCH_SIZE')
 MAX_LINGER = os.getenv('MAX_LINGER')
+METRICS_PORT = int(os.getenv('METRICS_PORT', '9100'))
 
-required_vars = ['CLIENT_ID', 'CLIENT_SECRET', 'ACCOUNT_NUMBER', 'INFLUXDB_URL', 'INFLUXDB_TOKEN', 'INFLUXDB_ORG', 'INFLUXDB_BUCKET', 'INFLUXDB_BUCKET_2', 'BATCH_SIZE', 'MAX_LINGER']
+required_vars = ['CLIENT_ID', 'CLIENT_SECRET', 'BATCH_SIZE', 'MAX_LINGER']
 for var in required_vars:
     if not os.getenv(var):
         raise RuntimeError(f"Missing required environment variable: {var}")
 
+# Shared buffer for latest Prometheus-formatted lines.
+latest_lines = []
+latest_lock = threading.Lock()
+ALERT_FIELDS = ('Alerts', 'ActiveAlerts', 'ActiveAlertIds')
+
+class MetricsHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path != "/metrics":
+            self.send_response(404)
+            self.end_headers()
+            return
+
+        with latest_lock:
+            body = "\n".join(latest_lines) + "\n" if latest_lines else "# no data yet\n"
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(body.encode("utf-8"))
+
+    def log_message(self, format, *args):
+        # Silence default logging to avoid noisy stdout.
+        return
+
+def start_http_server(port):
+    server = HTTPServer(("0.0.0.0", port), MetricsHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server
+
 def get_starlink_access_token():
-    response = requests.post(
-        f"{STARLINK_BASE_URL}/auth/connect/token",
-        data={
-            'client_id': CLIENT_ID,
-            'client_secret': CLIENT_SECRET,
-            'grant_type': 'client_credentials'
-        }
-    )
-    response.raise_for_status()
-    return response.json()['access_token']
+    return requests.post(
+        'https://api.starlink.com/auth/connect/token',
+        data=
+            {
+                'client_id' : CLIENT_ID,
+                'client_secret' : CLIENT_SECRET,
+                'grant_type' : 'client_credentials'
+            }
+    ).json()['access_token']
 
-def poll_starlink_telemetry(access_token):
-    response = requests.post(
-        f"{STARLINK_BASE_URL}/v2/telemetry/stream",
-        json={
-            "accountNumber": ACCOUNT_NUMBER,
-            "batchSize": BATCH_SIZE,
-            "maxLingerMs": MAX_LINGER
-        },
-        headers={
-            'Authorization': f'Bearer {access_token}',
-            'Content-Type': 'application/json'
-        }
-    )
-    return response
+def get_column_index(column_names, desired_column_name):
+    """
+    Gets the index for a telemtry metric (ex: ObstructionPercentTime).
 
-import h3
+    :param column_names: column names for a specific device type.
+    :param desired_column_name: column you want to get index of (ex: ObstructionPercentTime).
+    :return: index of the metric, or -1 if it can not be found.
+    """
+    index = 0
+    for column_name in column_names:
+        if column_name == desired_column_name:
+            return index
+        index += 1
 
-def write_telemetry_to_influx(values, column_names, write_api):
-    for entry in values:
-        device_type = entry[0]
-        timestamp_ns = entry[1]
-        device_id = entry[2]
+    return -1
 
-        fields = {}
-        tags = {'device_id': device_id}
-        
-        lat = long = None
+def map_entry_to_record(entry, columns):
+    """
+    Build a record dict by zipping telemetry entry values with their column names.
+    """
+    return {column: entry[idx] for idx, column in enumerate(columns) if idx < len(entry)}
 
-        for idx, value in enumerate(entry[3:], start=3):
-            col_name = column_names[device_type][idx]
+def clean_field_value(value):
+    """
+    Normalize values for output: collapse lists and skip empty values.
+    """
+    if value is None:
+        return None
+    if isinstance(value, list):
+        return ';'.join(str(v) for v in value if v is not None)
+    return value
 
-            # Handle H3CellId conversion directly
-            if col_name == "H3CellId" and value:
-                try:
-                    h3_cell_id_int = int(value)
-                    h3_hex = hex(h3_cell_id_int)
-                    if h3.is_valid_cell(h3_hex):
-                        lat, long = h3.cell_to_latlng(h3_hex)
-                except (ValueError, h3.H3CellError):
-                    logging.warning(f"Invalid H3 cell ID encountered: {value}")
-                continue  # Skip writing H3CellId directly to influx
+def extract_alert_codes(record):
+    """
+    Return a list of alert codes from a telemetry record, if present.
+    """
+    for field in ALERT_FIELDS:
+        if field in record:
+            val = record[field]
+            if isinstance(val, list):
+                return [str(v) for v in val if v is not None]
+            if val not in (None, ''):
+                return [str(val)]
+    return []
 
-            if isinstance(value, list):
-                fields[col_name] = ','.join(str(v) for v in value)
-            elif isinstance(value, (int, float)):
-                fields[col_name] = float(value)
-            elif isinstance(value, str) and value.strip() == "":
+def sanitize_label_value(value):
+    """
+    Simplistic label sanitization for Prometheus-friendly output.
+    """
+    return str(value).replace(' ', '_')
+
+def format_line_protocol(record, device_type_names, ip_lookup):
+    """
+    Convert a telemetry record into a Prometheus/OpenMetrics-friendly line.
+    Router records are ignored upstream; this function focuses on final formatting.
+    """
+    device_type_code = record.get('DeviceType')
+    device_type_label = device_type_names.get(device_type_code, device_type_code)
+    device_id = record.get('DeviceId')
+    timestamp = record.get('UtcTimestampNs')
+
+    if timestamp is None or device_id is None:
+        return None
+
+    fields = {}
+
+    # Start with the fields present on the record itself.
+    for key, value in record.items():
+        if key in {'DeviceType', 'UtcTimestampNs', 'DeviceId'}:
+            continue
+        if key in ALERT_FIELDS:
+            continue
+        cleaned_value = clean_field_value(value)
+        if cleaned_value is not None and cleaned_value != '':
+            fields[key] = cleaned_value
+
+    # Merge IP allocation data onto non-IP allocation records when device IDs match.
+    if device_type_code != 'i':
+        ip_record = ip_lookup.get(device_id)
+        if ip_record:
+            for key in ('Ipv4', 'Ipv6Ue', 'Ipv6Cpe'):
+                cleaned_value = clean_field_value(ip_record.get(key))
+                if cleaned_value:
+                    fields[key] = cleaned_value
+
+    if not fields:
+        return None
+
+    # Build the Prometheus/OpenMetrics style line.
+    field_fragments = []
+    for key, value in fields.items():
+        field_fragments.append(f"{key}={value}")
+
+    field_section = ",".join(field_fragments)
+    return f"starlink,device_type={device_type_label},deviceID={device_id} {field_section} {timestamp}"
+
+def format_alert_lines(record, device_type_names, alert_names_by_device):
+    """
+    Generate alert lines for a single record if active alerts exist.
+    """
+    device_type_code = record.get('DeviceType')
+    if device_type_code != 'u':  # Only UserTerminal alerts are emitted.
+        return []
+
+    timestamp = record.get('UtcTimestampNs')
+    device_id = record.get('DeviceId')
+    if timestamp is None or device_id is None:
+        return []
+
+    alert_codes = extract_alert_codes(record)
+    if not alert_codes:
+        return []
+
+    device_type_label = device_type_names.get(device_type_code, device_type_code)
+    alert_name_map = alert_names_by_device.get(device_type_code, {})
+
+    lines = []
+    for code in alert_codes:
+        alert_name = alert_name_map.get(code, code)
+        alert_label = sanitize_label_value(alert_name)
+        lines.append(
+            f"starlink_alert,device_type={device_type_label},deviceID={device_id},alert={alert_label} active=1 {timestamp}"
+        )
+    return lines
+
+def poll_stream():
+    """
+    Constantly polls telemetry API. Expect to get a response about every 15 seconds.
+    When called initially, you might receive a response more often as the stream catches up.
+    """
+    access_token = get_starlink_access_token()
+    start_http_server(METRICS_PORT)
+
+    while (True):
+        start_time = time.time()
+        response = requests.post(
+            'https://starlink.com/api/public/v2/telemetry/stream',
+            json=
+                {
+                    "batchSize": BATCH_SIZE,
+                    "maxLingerMs": MAX_LINGER
+                },
+            headers=
+                {
+                    'content-type' : 'application/json',
+                    'accept' : '*/*',
+                    'Authorization' : 'Bearer '+access_token
+                }
+        )
+
+        if (response.status_code != 200):
+            # Auth token expires ~15 minutes, so refresh it if invalid response.
+            access_token = get_starlink_access_token()
+        else:
+            response_json = response.json()
+
+            # The raw telemetry data points for all device types.
+            telemetry = response_json['data']['values']
+
+            # If no telemetry received, don't do any processing.
+            if (len(telemetry) == 0):
                 continue
-            else:
-                try:
-                    fields[col_name] = float(value)
-                except (ValueError, TypeError):
+
+            column_names_by_type = response_json['data']['columnNamesByDeviceType']
+            device_type_names = response_json.get('metadata', {}).get('enums', {}).get('DeviceType', {})
+            alert_names_by_device = response_json.get('metadata', {}).get('enums', {}).get('AlertsByDeviceType', {})
+
+            ip_lookup = {}
+            records = []
+
+            # Map telemetry entries to records keyed by column names, ignoring routers.
+            for entry in telemetry:
+                if not entry or entry[0] == 'r':
                     continue
 
-        # Include lat/long if successfully extracted
-        if lat is not None and long is not None:
-            fields['latitude'] = lat
-            fields['longitude'] = long
+                device_type_code = entry[0]
+                columns = column_names_by_type.get(device_type_code)
+                if not columns:
+                    continue
 
-        if not fields:
-            continue
+                record = map_entry_to_record(entry, columns)
+                records.append(record)
 
-        point = Point(f'starlink_{device_type}') \
-            .time(datetime.datetime.now(datetime.timezone.utc), WritePrecision.S)
+                if device_type_code == 'i':
+                    device_id = record.get('DeviceId')
+                    if device_id:
+                        ip_lookup[device_id] = record
 
-        # Add fields
-        for key, val in fields.items():
-            point.field(key, val)
-        
-        # Add tags
-        for tag_key, tag_val in tags.items():
-            point.tag(tag_key, tag_val)
+            # Emit Prometheus-friendly lines.
+            collected_lines = []
+            for record in records:
+                line = format_line_protocol(record, device_type_names, ip_lookup)
+                if line:
+                    print(line, flush=True)
+                    collected_lines.append(line)
 
-        write_api.write(bucket=INFLUXDB_BUCKET, org=INFLUXDB_ORG, record=point)
+                # Emit alerts if present for user terminals.
+                alert_lines = format_alert_lines(record, device_type_names, alert_names_by_device)
+                for alert_line in alert_lines:
+                    print(alert_line, flush=True)
+                collected_lines.extend(alert_lines)
 
-def write_alerts_to_influx(alerts_by_device, write_api):
-    for device_type, alerts_dict in alerts_by_device.items():
-        for code, name in alerts_dict.items():
-            point = (
-                Point("device_alert")
-                .tag("device_type", device_type)
-                .tag("code", code)
-                .field("alert_name", name)
-                .time(datetime.datetime.now(datetime.timezone.utc), WritePrecision.S)
-            )
-            write_api.write(bucket=INFLUXDB_BUCKET_2, org=INFLUXDB_ORG, record=point)
-
-def main():
-    access_token = get_starlink_access_token()
-    influx_client = InfluxDBClient(url=INFLUXDB_URL, token=INFLUXDB_TOKEN, org=INFLUXDB_ORG)
-    write_api = influx_client.write_api(write_options=SYNCHRONOUS)
-
-    try:
-        while True:
-            start_time = time.time()
-            response = poll_starlink_telemetry(access_token)
-
-            if response.status_code == 401:
-                logging.info("Access token expired, refreshing...")
-                access_token = get_starlink_access_token()
-                continue
-
-            try:
-                response.raise_for_status()
-            except requests.HTTPError as e:
-                logging.error(f"HTTP error: {e}")
-                continue
-
-            data = response.json().get('data', {})
-            values = data.get('values', [])
-            column_names = data.get('columnNamesByDeviceType', {})
-
-            metadata = response.json().get('metadata', {})
-            enums = metadata.get('enums', {})
-            alerts_by_device = enums.get('AlertsByDeviceType', {})
-
-            if values:
-                write_telemetry_to_influx(values, column_names, write_api)
-                logging.info(f"Wrote {len(values)} telemetry points to InfluxDB.")
-                write_alerts_to_influx(alerts_by_device, write_api)
-                logging.info(f"Wrote {len(alerts_by_device)} alert types to InfluxDB.")
-            else:
-                logging.info("No new telemetry data.")
-
+            with latest_lock:
+                latest_lines[:] = collected_lines
+            
             elapsed_time = time.time() - start_time
             sleep_duration = max(0, 15 - elapsed_time)
             time.sleep(sleep_duration)
-    except KeyboardInterrupt:
-        logging.info("Terminated by user.")
-    finally:
-        influx_client.close()
 
 if __name__ == '__main__':
-    main()
+    poll_stream()
