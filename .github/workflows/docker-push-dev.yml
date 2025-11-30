@@ -1,8 +1,15 @@
-name: Build and Push Docker Image
+name: Development - Build and Push Docker Image
 
 on:
   push:
-    branches: ["**"]  # All branches
+    branches-ignore:
+      - main
+    paths:
+      - script.py
+      - docker-compose.yml
+      - Docker/Dockerfile
+      - requirements.txt
+      - .env
 
 env:
   IMAGE_NAME: itsmrrobot/starlink-telemetry
@@ -33,4 +40,4 @@ jobs:
           context: .
           file: ${{ env.DOCKERFILE_PATH }}
           push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-          tags: ${{ env.IMAGE_NAME }}:latest
+          tags: ${{ env.IMAGE_NAME }}:dev
