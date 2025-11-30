@@ -149,6 +149,8 @@ def format_line_protocol(record, device_type_names, ip_lookup):
     device_type_code = record.get('DeviceType')
     device_type_label = device_type_names.get(device_type_code, device_type_code)
     device_id = record.get('DeviceId')
+    if device_type_code == 'i' and isinstance(device_id, str) and device_id.startswith("ip-"):
+        device_id = device_id[3:]
     if record.get('UtcTimestampNs') is None or device_id is None:
         return []
 
