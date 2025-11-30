@@ -10,6 +10,7 @@ on:
       - Docker/Dockerfile
       - requirements.txt
       - .env
+      - .github/workflows/docker-push-main.yml
 
 env:
   IMAGE_NAME: itsmrrobot/starlink-telemetry
