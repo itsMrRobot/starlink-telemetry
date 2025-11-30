@@ -3,6 +3,7 @@ import os
 import threading
 import time
 import re
+import ipaddress
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from dotenv import load_dotenv
 
@@ -124,6 +125,22 @@ def to_float(value):
     except (ValueError, TypeError):
         return None
 
+def ip_to_numeric(ip_str):
+    """
+    Convert IP string to a numeric value to avoid volatile labels.
+    IPv4 -> integer form. IPv6 -> folded into a float-friendly 52-bit space.
+    """
+    try:
+        ip_obj = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return None
+
+    if ip_obj.version == 4:
+        return float(int(ip_obj))
+
+    # IPv6 values exceed float precision; fold into lower 52 bits to stay stable.
+    return float(int(ip_obj) & ((1 << 52) - 1))
+
 def format_line_protocol(record, device_type_names, ip_lookup):
     """
     Convert a telemetry record into Prometheus exposition lines.
@@ -132,15 +149,10 @@ def format_line_protocol(record, device_type_names, ip_lookup):
     device_type_code = record.get('DeviceType')
     device_type_label = device_type_names.get(device_type_code, device_type_code)
     device_id = record.get('DeviceId')
-    timestamp = record.get('UtcTimestampNs')
-
-    if timestamp is None or device_id is None:
+    if record.get('UtcTimestampNs') is None or device_id is None:
         return []
 
-    ts_ms = int(timestamp / 1_000_000)
-
     numeric_metrics = []
-    info_labels = {}
 
     # Start with the fields present on the record itself.
     for key, value in record.items():
@@ -156,20 +168,6 @@ def format_line_protocol(record, device_type_names, ip_lookup):
         if numeric_val is not None:
             metric_name = sanitize_metric_name(f"starlink_{key}")
             numeric_metrics.append((metric_name, numeric_val))
-        else:
-            info_labels[sanitize_metric_name(key.lower())] = str(cleaned_value)
-
-    # Merge IP allocation data onto non-IP allocation records when device IDs match.
-    if device_type_code != 'i':
-        ip_record = ip_lookup.get(device_id)
-        if ip_record:
-            for key in ('Ipv4', 'Ipv6Ue', 'Ipv6Cpe'):
-                cleaned_value = clean_field_value(ip_record.get(key))
-                if cleaned_value:
-                    info_labels[sanitize_metric_name(key.lower())] = str(cleaned_value)
-
-    if not numeric_metrics and not info_labels:
-        return []
 
     base_labels = {
         'device_type': device_type_label,
@@ -181,13 +179,25 @@ def format_line_protocol(record, device_type_names, ip_lookup):
     # Numeric metrics emitted individually.
     for metric_name, value in numeric_metrics:
         label_str = ",".join(f'{k}="{sanitize_label_value(v)}"' for k, v in base_labels.items())
-        lines.append(f"{metric_name}{{{label_str}}} {value} {ts_ms}")
+        lines.append(f"{metric_name}{{{label_str}}} {value}")
 
-    # Info metric for string/list fields.
-    if info_labels:
-        merged_labels = {**base_labels, **info_labels}
-        label_str = ",".join(f'{k}="{sanitize_label_value(v)}"' for k, v in merged_labels.items())
-        lines.append(f"starlink_info{{{label_str}}} 1 {ts_ms}")
+    # IP metrics as values (not labels) to avoid volatile cardinality.
+    if device_type_code != 'i':
+        ip_record = ip_lookup.get(device_id)
+        if ip_record:
+            ip_fields = {k: ip_record.get(k) for k in ('Ipv4', 'Ipv6Ue', 'Ipv6Cpe')}
+            for key, raw_val in ip_fields.items():
+                if raw_val in (None, ''):
+                    continue
+                values = raw_val if isinstance(raw_val, list) else [raw_val]
+                for idx, ip_str in enumerate(values):
+                    numeric_ip = ip_to_numeric(ip_str)
+                    if numeric_ip is None:
+                        continue
+                    label_str = ",".join(f'{k}="{sanitize_label_value(v)}"' for k, v in base_labels.items())
+                    metric_suffix = f"_{idx}" if len(values) > 1 else ""
+                    metric_name = sanitize_metric_name(f"starlink_{key}_numeric{metric_suffix}")
+                    lines.append(f"{metric_name}{{{label_str}}} {numeric_ip}")
 
     return lines
 
@@ -199,9 +209,8 @@ def format_alert_lines(record, device_type_names, alert_names_by_device):
     if device_type_code != 'u':  # Only UserTerminal alerts are emitted.
         return []
 
-    timestamp = record.get('UtcTimestampNs')
     device_id = record.get('DeviceId')
-    if timestamp is None or device_id is None:
+    if device_id is None:
         return []
 
     alert_codes = extract_alert_codes(record)
@@ -217,11 +226,11 @@ def format_alert_lines(record, device_type_names, alert_names_by_device):
         label_str = ",".join(
             [
                 f'device_type="{sanitize_label_value(device_type_label)}"',
-                f'deviceID="{sanitize_label_value(device_id)}"',
-                f'alert="{sanitize_label_value(alert_name)}"'
+                f'deviceID="{sanitize_label_value(device_id)}"'
             ]
         )
-        lines.append(f"starlink_alert_active{{{label_str}}} 1 {int(timestamp/1_000_000)}")
+        metric_name = sanitize_metric_name(f"starlink_alert_active_{alert_name}")
+        lines.append(f"{metric_name}{{{label_str}}} 1")
     return lines
 
 def poll_stream():
