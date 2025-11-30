@@ -1,4 +1,2 @@
-influxdb-client
 requests
 python-dotenv
-h3

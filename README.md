@@ -1,68 +1,70 @@
-Starlink Telemetry Collector
-============================
+Starlink Telemetry Prometheus Exporter
+======================================
 
-Python service that authenticates with the Starlink Enterprise API, streams telemetry for a single account, and writes both telemetry fields and alert metadata to InfluxDB. The script converts H3 cell IDs into latitude/longitude before writing so location is immediately usable downstream.
+Python service that authenticates with the Starlink Enterprise API, streams telemetry for an account, and exposes Prometheus metrics on `/metrics`. Telemetry values and active alerts are rendered as Prometheus exposition text for scraping.
 
 How it works
 ------------
-- Obtain an OAuth token from `https://starlink.com/api/public/auth/connect/token` using your client credentials.
-- Stream telemetry via `v2/telemetry/stream` for the configured `ACCOUNT_NUMBER` with the requested batch size and linger settings.
-- Parse values/column metadata per device type, convert H3 cells to `latitude`/`longitude`, and write measurements to InfluxDB (`starlink_<device_type>`).
-- Persist alert codes/names as separate `device_alert` points in a dedicated bucket.
+- Obtain an OAuth token from `https://starlink.com/api/public/auth/connect/token` using client credentials.
+- Stream telemetry via `v2/telemetry/stream` using `BATCH_SIZE` and `MAX_LINGER`.
+- Map column metadata per device type, merge IP allocation rows into UserTerminal rows, and emit Prometheus metrics:
+  - Numeric alert fields become `starlink_<field>` gauges with `device_type` and `deviceID` labels.
+  - String/list fields become a single `starlink_info{...} 1` label set per device.
+  - Active alerts emit `starlink_alert_active{device_type,deviceID,alert} 1`; the alert name is resolved from `metadata.enums.AlertsByDeviceType` each poll.
+- Metrics are served from an in-process HTTP server on `0.0.0.0:<METRICS_PORT>` (default `9100`).
 
 Environment variables
 ---------------------
-All variables are required; the script exits if any are missing.
+All required unless noted.
 
 | Name | Description | Example |
 | --- | --- | --- |
 | `CLIENT_ID` | Starlink Enterprise API client id | `abc123` |
 | `CLIENT_SECRET` | Starlink Enterprise API client secret | `shh-very-secret` |
-| `ACCOUNT_NUMBER` | Target Starlink account number | `0000123456` |
-| `INFLUXDB_URL` | InfluxDB base URL | `http://influxdb:8086` |
-| `INFLUXDB_TOKEN` | InfluxDB API token with write access | `my-influx-token` |
-| `INFLUXDB_ORG` | InfluxDB org name | `my-org` |
-| `INFLUXDB_BUCKET` | Bucket for telemetry points | `starlink` |
-| `INFLUXDB_BUCKET_2` | Bucket for alert metadata | `alert_type` |
-| `BATCH_SIZE` | Number of telemetry records per poll (e.g., `1000`) | `1000` |
-| `MAX_LINGER` | Max wait in ms before API responds (e.g., `15000`) | `15000` |
+| `BATCH_SIZE` | Number of telemetry records per poll | `1000` |
+| `MAX_LINGER` | Max wait in ms before API responds | `15000` |
+| `METRICS_PORT` | (Optional) Port for `/metrics` | `9100` |
 
 Example `.env`
 --------------
 ```
 CLIENT_ID=your-client-id
 CLIENT_SECRET=your-client-secret
-ACCOUNT_NUMBER=your-account-number
-
-INFLUXDB_URL=http://influxdb:8086
-INFLUXDB_TOKEN=your-influx-token
-INFLUXDB_ORG=your-org
-INFLUXDB_BUCKET=starlink
-INFLUXDB_BUCKET_2=alert_type
-
 BATCH_SIZE=1000
 MAX_LINGER=15000
+# METRICS_PORT=9100
 ```
+
+Prometheus scraping
+-------------------
+- Endpoint: `http://<host>:9100/metrics` (or your `METRICS_PORT`).
+- Suggested `scrape_interval`: 20–30s with `MAX_LINGER=15000` (1.5–2× the expected batch cadence).
+- Only active alerts produce `starlink_alert_active` lines; router records are dropped.
 
 Run with Docker Compose
 -----------------------
 1. Create `.env` in the repo root with the variables above.
-2. Start the service:
+2. (Optional) expose the metrics port if scraping from outside the container:
+   ```yaml
+   services:
+     starlink-telemetry:
+       ports:
+         - "9100:9100"
+   ```
+3. Start the service:
    ```
    docker compose up -d
    ```
-   The included `docker-compose.yml` uses the published image `itsmrrobot/starlink-telemetry:latest` and mounts your `.env`.
-3. Check logs:
+4. Check logs:
    ```
    docker compose logs -f starlink-telemetry
    ```
 
 Build and run locally with Docker
 ---------------------------------
-If you prefer to build locally instead of using the published image:
 ```
 docker build -t starlink-telemetry -f Docker/Dockerfile .
-docker run --env-file .env --name starlink-telemetry --restart always starlink-telemetry
+docker run --env-file .env -p 9100:9100 --name starlink-telemetry --restart always starlink-telemetry
 ```
 
 Run without Docker
@@ -76,6 +78,6 @@ python script.py
 
 Notes
 -----
-- The script refreshes the token automatically on HTTP 401 responses.
-- Influx points are written with current UTC time; adjust inside `script.py` if you need to use API timestamps instead.
-- For additional details on the Starlink Enterprise API, see the docs: https://starlink.readme.io/docs/getting-started
+- The script refreshes the token automatically on non-200 responses.
+- Timestamps are converted from ns to ms for Prometheus.
+- For additional details on the Starlink Enterprise API, see: https://starlink.readme.io/docs/getting-started
