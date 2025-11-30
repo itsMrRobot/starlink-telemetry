@@ -204,7 +204,7 @@ def format_line_protocol(record, device_type_names, ip_lookup):
 
     # Info line with additional fields emitted as data (tags limited to device_type/deviceID).
     if info_fields:
-        info_payload = ",".join(f"{k}=\"{sanitize_label_value(v)}\"" for k, v in info_fields.items())
+        info_payload = ",".join(f"{k}={sanitize_label_value(v)}" for k, v in info_fields.items())
         lines.append(f"starlink_info,device_type={sanitize_label_value(device_type_label)},deviceID={sanitize_label_value(device_id)} {info_payload}")
 
     return lines
