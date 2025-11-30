@@ -2,7 +2,8 @@ name: Build and Push Docker Image
 
 on:
   push:
-    branches: ["**"]  # All branches
+    branches:
+      - main
 
 env:
   IMAGE_NAME: itsmrrobot/starlink-telemetry

@@ -2,6 +2,7 @@ import requests
 import os
 import threading
 import time
+import re
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from dotenv import load_dotenv
 
@@ -109,11 +110,23 @@ def sanitize_label_value(value):
     """
     Simplistic label sanitization for Prometheus-friendly output.
     """
-    return str(value).replace(' ', '_')
+    return str(value).replace('\\', '\\\\').replace('\n', '\\n').replace('"', '\\"')
+
+def sanitize_metric_name(name):
+    """
+    Convert field names to Prometheus-safe metric identifiers.
+    """
+    return re.sub(r'[^a-zA-Z0-9_:]', '_', name)
+
+def to_float(value):
+    try:
+        return float(value)
+    except (ValueError, TypeError):
+        return None
 
 def format_line_protocol(record, device_type_names, ip_lookup):
     """
-    Convert a telemetry record into a Prometheus/OpenMetrics-friendly line.
+    Convert a telemetry record into Prometheus exposition lines.
     Router records are ignored upstream; this function focuses on final formatting.
     """
     device_type_code = record.get('DeviceType')
@@ -122,9 +135,12 @@ def format_line_protocol(record, device_type_names, ip_lookup):
     timestamp = record.get('UtcTimestampNs')
 
     if timestamp is None or device_id is None:
-        return None
+        return []
 
-    fields = {}
+    ts_ms = int(timestamp / 1_000_000)
+
+    numeric_metrics = []
+    info_labels = {}
 
     # Start with the fields present on the record itself.
     for key, value in record.items():
@@ -133,8 +149,15 @@ def format_line_protocol(record, device_type_names, ip_lookup):
         if key in ALERT_FIELDS:
             continue
         cleaned_value = clean_field_value(value)
-        if cleaned_value is not None and cleaned_value != '':
-            fields[key] = cleaned_value
+        if cleaned_value is None or cleaned_value == '':
+            continue
+
+        numeric_val = to_float(cleaned_value)
+        if numeric_val is not None:
+            metric_name = sanitize_metric_name(f"starlink_{key}")
+            numeric_metrics.append((metric_name, numeric_val))
+        else:
+            info_labels[sanitize_metric_name(key.lower())] = str(cleaned_value)
 
     # Merge IP allocation data onto non-IP allocation records when device IDs match.
     if device_type_code != 'i':
@@ -143,18 +166,30 @@ def format_line_protocol(record, device_type_names, ip_lookup):
             for key in ('Ipv4', 'Ipv6Ue', 'Ipv6Cpe'):
                 cleaned_value = clean_field_value(ip_record.get(key))
                 if cleaned_value:
-                    fields[key] = cleaned_value
+                    info_labels[sanitize_metric_name(key.lower())] = str(cleaned_value)
 
-    if not fields:
-        return None
+    if not numeric_metrics and not info_labels:
+        return []
 
-    # Build the Prometheus/OpenMetrics style line.
-    field_fragments = []
-    for key, value in fields.items():
-        field_fragments.append(f"{key}={value}")
+    base_labels = {
+        'device_type': device_type_label,
+        'deviceID': device_id
+    }
 
-    field_section = ",".join(field_fragments)
-    return f"starlink,device_type={device_type_label},deviceID={device_id} {field_section} {timestamp}"
+    lines = []
+
+    # Numeric metrics emitted individually.
+    for metric_name, value in numeric_metrics:
+        label_str = ",".join(f'{k}="{sanitize_label_value(v)}"' for k, v in base_labels.items())
+        lines.append(f"{metric_name}{{{label_str}}} {value} {ts_ms}")
+
+    # Info metric for string/list fields.
+    if info_labels:
+        merged_labels = {**base_labels, **info_labels}
+        label_str = ",".join(f'{k}="{sanitize_label_value(v)}"' for k, v in merged_labels.items())
+        lines.append(f"starlink_info{{{label_str}}} 1 {ts_ms}")
+
+    return lines
 
 def format_alert_lines(record, device_type_names, alert_names_by_device):
     """
@@ -179,10 +214,14 @@ def format_alert_lines(record, device_type_names, alert_names_by_device):
     lines = []
     for code in alert_codes:
         alert_name = alert_name_map.get(code, code)
-        alert_label = sanitize_label_value(alert_name)
-        lines.append(
-            f"starlink_alert,device_type={device_type_label},deviceID={device_id},alert={alert_label} active=1 {timestamp}"
+        label_str = ",".join(
+            [
+                f'device_type="{sanitize_label_value(device_type_label)}"',
+                f'deviceID="{sanitize_label_value(device_id)}"',
+                f'alert="{sanitize_label_value(alert_name)}"'
+            ]
         )
+        lines.append(f"starlink_alert_active{{{label_str}}} 1 {int(timestamp/1_000_000)}")
     return lines
 
 def poll_stream():
@@ -251,10 +290,10 @@ def poll_stream():
             # Emit Prometheus-friendly lines.
             collected_lines = []
             for record in records:
-                line = format_line_protocol(record, device_type_names, ip_lookup)
-                if line:
+                lines = format_line_protocol(record, device_type_names, ip_lookup)
+                for line in lines:
                     print(line, flush=True)
-                    collected_lines.append(line)
+                collected_lines.extend(lines)
 
                 # Emit alerts if present for user terminals.
                 alert_lines = format_alert_lines(record, device_type_names, alert_names_by_device)
