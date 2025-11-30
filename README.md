@@ -8,9 +8,10 @@ How it works
 - Obtain an OAuth token from `https://starlink.com/api/public/auth/connect/token` using client credentials.
 - Stream telemetry via `v2/telemetry/stream` using `BATCH_SIZE` and `MAX_LINGER`.
 - Map column metadata per device type, merge IP allocation rows into UserTerminal rows, and emit Prometheus metrics:
-  - Numeric fields become `starlink_<field>` gauges with labels restricted to `device_type` and `deviceID`.
-  - IP allocation data is emitted as numeric metrics (IPv4 integer form; IPv6 folded into 52 bits) with the same two labels; multiple IPs use indexed metric names.
-  - Active alerts emit `starlink_alert_active_<alertName>{device_type,deviceID} 1`; the alert name is resolved from `metadata.enums.AlertsByDeviceType` each poll.
+  - Numeric fields become `starlink_<field>` gauges with `device_type` and `deviceID` labels.
+  - String/list fields become a single `starlink_info{...} 1` label set per device.
+  - IP allocation data is emitted as numeric metrics (IPv4 integer form; IPv6 folded into 52 bits) with stable labels `device_type`, `deviceID`, `ip_index`, and `ip_version`.
+  - Active alerts emit `starlink_alert_active{device_type,deviceID,alert} 1`; the alert name is resolved from `metadata.enums.AlertsByDeviceType` each poll.
 - Metrics are served from an in-process HTTP server on `0.0.0.0:<METRICS_PORT>` (default `9100`).
 
 Environment variables
