@@ -153,7 +153,7 @@ def format_line_protocol(record, device_type_names, ip_lookup):
         return []
 
     numeric_metrics = []
-    info_labels = {}
+    info_fields = {}
 
     # Start with the fields present on the record itself.
     for key, value in record.items():
@@ -170,7 +170,7 @@ def format_line_protocol(record, device_type_names, ip_lookup):
             metric_name = sanitize_metric_name(f"starlink_{key}")
             numeric_metrics.append((metric_name, numeric_val))
         else:
-            info_labels[sanitize_metric_name(key.lower())] = str(cleaned_value)
+            info_fields[sanitize_metric_name(key.lower())] = str(cleaned_value)
 
     base_labels = {
         'device_type': device_type_label,
@@ -183,12 +183,6 @@ def format_line_protocol(record, device_type_names, ip_lookup):
     for metric_name, value in numeric_metrics:
         label_str = ",".join(f'{k}="{sanitize_label_value(v)}"' for k, v in base_labels.items())
         lines.append(f"{metric_name}{{{label_str}}} {value}")
-
-    # Info metric for string/list fields.
-    if info_labels:
-        merged_labels = {**base_labels, **info_labels}
-        label_str = ",".join(f'{k}="{sanitize_label_value(v)}"' for k, v in merged_labels.items())
-        lines.append(f"starlink_info{{{label_str}}} 1")
 
     # IP metrics as values (not labels) to avoid volatile cardinality.
     if device_type_code != 'i':
@@ -203,12 +197,15 @@ def format_line_protocol(record, device_type_names, ip_lookup):
                     numeric_ip = ip_to_numeric(ip_str)
                     if numeric_ip is None:
                         continue
-                    label_parts = [f'{k}="{sanitize_label_value(v)}"' for k, v in base_labels.items()]
-                    label_parts.append(f'ip_index="{idx}"')
-                    label_parts.append(f'ip_version="{"6" if ":" in ip_str else "4"}"')
-                    label_str = ",".join(label_parts)
-                    metric_name = sanitize_metric_name(f"starlink_{key}_numeric")
+                    label_str = ",".join(f'{k}="{sanitize_label_value(v)}"' for k, v in base_labels.items())
+                    metric_suffix = f"_{idx}" if len(values) > 1 else ""
+                    metric_name = sanitize_metric_name(f"starlink_{key}_numeric{metric_suffix}")
                     lines.append(f"{metric_name}{{{label_str}}} {numeric_ip}")
+
+    # Info line with additional fields emitted as data (tags limited to device_type/deviceID).
+    if info_fields:
+        info_payload = ",".join(f"{k}=\"{sanitize_label_value(v)}\"" for k, v in info_fields.items())
+        lines.append(f"starlink_info,device_type={sanitize_label_value(device_type_label)},deviceID={sanitize_label_value(device_id)} {info_payload}")
 
     return lines
 
@@ -234,14 +231,14 @@ def format_alert_lines(record, device_type_names, alert_names_by_device):
     lines = []
     for code in alert_codes:
         alert_name = alert_name_map.get(code, code)
+        metric_name = sanitize_metric_name(f"starlink_alert_active_{alert_name}")
         label_str = ",".join(
             [
                 f'device_type="{sanitize_label_value(device_type_label)}"',
-                f'deviceID="{sanitize_label_value(device_id)}"',
-                f'alert="{sanitize_label_value(alert_name)}"'
+                f'deviceID="{sanitize_label_value(device_id)}"'
             ]
         )
-        lines.append(f"starlink_alert_active{{{label_str}}} 1")
+        lines.append(f"{metric_name}{{{label_str}}} 1")
     return lines
 
 def poll_stream():

@@ -7,11 +7,11 @@ How it works
 ------------
 - Obtain an OAuth token from `https://starlink.com/api/public/auth/connect/token` using client credentials.
 - Stream telemetry via `v2/telemetry/stream` using `BATCH_SIZE` and `MAX_LINGER`.
-- Map column metadata per device type, merge IP allocation rows into UserTerminal rows, and emit Prometheus metrics:
-  - Numeric fields become `starlink_<field>` gauges with `device_type` and `deviceID` labels.
-  - String/list fields become a single `starlink_info{...} 1` label set per device.
-  - IP allocation data is emitted as numeric metrics (IPv4 integer form; IPv6 folded into 52 bits) with stable labels `device_type`, `deviceID`, `ip_index`, and `ip_version`.
-  - Active alerts emit `starlink_alert_active{device_type,deviceID,alert} 1`; the alert name is resolved from `metadata.enums.AlertsByDeviceType` each poll.
+- Map column metadata per device type, merge IP allocation rows into UserTerminal rows, and emit Prometheus-style output:
+  - Numeric fields become `starlink_<field>` gauges with labels limited to `device_type` and `deviceID`.
+  - Non-numeric metadata per device is emitted as a `starlink_info` line (line-protocol style) with only `device_type`/`deviceID` tags; the remaining key/values are included in the data section.
+  - IP allocation data is emitted as numeric metrics (IPv4 integer form; IPv6 folded into 52 bits) with the same two labels; multiple IPs use indexed metric names.
+  - Active alerts emit `starlink_alert_active_<alertName>{device_type,deviceID} 1`; the alert name is resolved from `metadata.enums.AlertsByDeviceType` each poll.
 - Metrics are served from an in-process HTTP server on `0.0.0.0:<METRICS_PORT>` (default `9100`).
 
 Environment variables
@@ -40,7 +40,8 @@ Prometheus scraping
 -------------------
 - Endpoint: `http://<host>:9100/metrics` (or your `METRICS_PORT`).
 - Suggested `scrape_interval`: 20–30s with `MAX_LINGER=15000` (1.5–2× the expected batch cadence).
-- Only active alerts produce `starlink_alert_active` lines; router records are dropped.
+- Only active alerts produce `starlink_alert_active_*` lines; router records are dropped.
+- `starlink_info` lines are emitted in a line-protocol-style string payload (device_type/deviceID as tags, remaining fields as data). Ensure your scraper can handle these alongside the Prometheus-style gauge lines.
 
 Run with Docker Compose
 -----------------------
