@@ -9,6 +9,7 @@ How it works
 - Stream telemetry via `v2/telemetry/stream` using `BATCH_SIZE` and `MAX_LINGER`.
 - Map column metadata per device type, merge IP allocation rows into UserTerminal rows, and build batch inserts:
   - Telemetry rows: numeric fields → `metrics` Map(String,Float64); non-numeric fields → `info` Map(String,String); stored with `device_type`, `device_id`, `ts_ns`.
+  - When `H3CellId` is present, latitude/longitude are derived and stored in `info` as `latitude` and `longitude`.
   - Alert rows: resolved alert names (codes mapped via `metadata.enums.AlertsByDeviceType`) with `device_type`, `device_id`, `ts_ns`.
   - IP allocation rows: arrays of IPv4/IPv6 strings per device_id with `ts_ns`.
 - Data is written to ClickHouse over HTTP using `JSONEachRow` with retry/backoff; polling halts on write failure to avoid losing cached telemetry.

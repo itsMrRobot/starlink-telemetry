@@ -2,6 +2,11 @@ import json
 import os
 import time
 import requests
+try:
+    import h3
+    H3_AVAILABLE = True
+except ImportError:
+    H3_AVAILABLE = False
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -73,6 +78,26 @@ def normalize_device_id(device_type_code, device_id):
     if device_type_code == 'i' and isinstance(device_id, str) and device_id.startswith("ip-"):
         return device_id[3:]
     return device_id
+
+def h3_to_lat_lon(cell_value):
+    """
+    Convert H3 cell id to (lat, lon). Returns None if conversion fails or h3 is unavailable.
+    """
+    if not H3_AVAILABLE or cell_value in (None, ''):
+        return None
+    try:
+        if isinstance(cell_value, int):
+            cell_str = hex(cell_value)
+        else:
+            # Accept both hex string and plain string; convert digits to int->hex for safety.
+            if isinstance(cell_value, str) and cell_value.isdigit():
+                cell_str = hex(int(cell_value))
+            else:
+                cell_str = str(cell_value)
+        lat, lon = h3.cell_to_latlng(cell_str)
+        return lat, lon
+    except Exception:
+        return None
 
 def ensure_tables():
     ddl_statements = [
@@ -196,17 +221,24 @@ def build_rows(telemetry, column_names_by_type, device_type_names, alert_names_b
 
         metrics = {}
         info = {}
+        lat_lon = None
         for key, value in record.items():
             if key in {'DeviceType', 'UtcTimestampNs', 'DeviceId'} or key in ALERT_FIELDS:
                 continue
             cleaned_value = clean_field_value(value)
             if cleaned_value is None or cleaned_value == '':
                 continue
+            if key == 'H3CellId':
+                lat_lon = h3_to_lat_lon(value)
             numeric_val = to_float(cleaned_value)
             if numeric_val is not None:
                 metrics[key] = numeric_val
             else:
                 info[key] = str(cleaned_value)
+
+        if lat_lon:
+            info['latitude'] = str(lat_lon[0])
+            info['longitude'] = str(lat_lon[1])
 
         telemetry_rows.append(
             {
