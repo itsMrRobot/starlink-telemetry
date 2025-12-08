@@ -1,18 +1,17 @@
-Starlink Telemetry Prometheus Exporter
-======================================
+Starlink Telemetry → ClickHouse
+===============================
 
-Python service that authenticates with the Starlink Enterprise API, streams telemetry for an account, and exposes Prometheus metrics on `/metrics`. Telemetry values and active alerts are rendered as Prometheus exposition text for scraping.
+Python service that authenticates with the Starlink Enterprise API, streams telemetry for an account, and writes telemetry, alerts, and IP allocation data directly into ClickHouse.
 
 How it works
 ------------
 - Obtain an OAuth token from `https://starlink.com/api/public/auth/connect/token` using client credentials.
 - Stream telemetry via `v2/telemetry/stream` using `BATCH_SIZE` and `MAX_LINGER`.
-- Map column metadata per device type, merge IP allocation rows into UserTerminal rows, and emit Prometheus-style output:
-  - Numeric fields become `starlink_<field>` gauges with labels `device_type` and `deviceID`.
-  - Non-numeric metadata per device is emitted as `starlink_info{device_type,deviceID,...} 1` with the remaining key/values carried as labels.
-  - IP allocation data is emitted as numeric metrics (IPv4 integer form; IPv6 folded into 52 bits) with the same two labels; multiple IPs use indexed metric names.
-  - Active alerts emit `starlink_alert_active_<alertName>{device_type,deviceID} 1`; the alert name is resolved from `metadata.enums.AlertsByDeviceType` each poll.
-- Metrics are served from an in-process HTTP server on `0.0.0.0:<METRICS_PORT>` (default `9100`).
+- Map column metadata per device type, merge IP allocation rows into UserTerminal rows, and build batch inserts:
+  - Telemetry rows: numeric fields → `metrics` Map(String,Float64); non-numeric fields → `info` Map(String,String); stored with `device_type`, `device_id`, `ts_ns`.
+  - Alert rows: resolved alert names (codes mapped via `metadata.enums.AlertsByDeviceType`) with `device_type`, `device_id`, `ts_ns`.
+  - IP allocation rows: arrays of IPv4/IPv6 strings per device_id with `ts_ns`.
+- Data is written to ClickHouse over HTTP using `JSONEachRow` with retry/backoff; polling halts on write failure to avoid losing cached telemetry.
 
 Environment variables
 ---------------------
@@ -24,7 +23,10 @@ All required unless noted.
 | `CLIENT_SECRET` | Starlink Enterprise API client secret | `shh-very-secret` |
 | `BATCH_SIZE` | Number of telemetry records per poll | `1000` |
 | `MAX_LINGER` | Max wait in ms before API responds | `15000` |
-| `METRICS_PORT` | (Optional) Port for `/metrics` | `9100` |
+| `CLICKHOUSE_URL` | ClickHouse HTTP endpoint | `http://clickhouse:8123` |
+| `CLICKHOUSE_USER` | ClickHouse user | `starlink` |
+| `CLICKHOUSE_PASSWORD` | ClickHouse password | `change_me` |
+| `CLICKHOUSE_DB` | Target database | `starlink` |
 
 Example `.env`
 --------------
@@ -33,31 +35,21 @@ CLIENT_ID=your-client-id
 CLIENT_SECRET=your-client-secret
 BATCH_SIZE=1000
 MAX_LINGER=15000
-# METRICS_PORT=9100
-```
 
-Prometheus scraping
--------------------
-- Endpoint: `http://<host>:9100/metrics` (or your `METRICS_PORT`).
-- Suggested `scrape_interval`: 20–30s with `MAX_LINGER=15000` (1.5–2× the expected batch cadence).
-- Only active alerts produce `starlink_alert_active_*` lines; router records are dropped.
-- `starlink_info` metrics carry additional metadata as labels alongside `device_type`/`deviceID` with a constant value of `1`.
+CLICKHOUSE_URL=http://clickhouse:8123
+CLICKHOUSE_USER=starlink
+CLICKHOUSE_PASSWORD=change_me
+CLICKHOUSE_DB=starlink
+```
 
 Run with Docker Compose
 -----------------------
 1. Create `.env` in the repo root with the variables above.
-2. (Optional) expose the metrics port if scraping from outside the container:
-   ```yaml
-   services:
-     starlink-telemetry:
-       ports:
-         - "9100:9100"
-   ```
-3. Start the service:
+2. Start the services:
    ```
    docker compose up -d
    ```
-4. Check logs:
+3. Check logs:
    ```
    docker compose logs -f starlink-telemetry
    ```
@@ -66,7 +58,7 @@ Build and run locally with Docker
 ---------------------------------
 ```
 docker build -t starlink-telemetry -f Docker/Dockerfile .
-docker run --env-file .env -p 9100:9100 --name starlink-telemetry --restart always starlink-telemetry
+docker run --env-file .env --network your-network --name starlink-telemetry --restart always starlink-telemetry
 ```
 
 Run without Docker
@@ -81,5 +73,5 @@ python script.py
 Notes
 -----
 - The script refreshes the token automatically on non-200 responses.
-- Metrics omit explicit timestamps; Prometheus will timestamp on scrape.
+- Inserts use retry/backoff and block further polling on failure to avoid data loss.
 - For additional details on the Starlink Enterprise API, see: https://starlink.readme.io/docs/getting-started

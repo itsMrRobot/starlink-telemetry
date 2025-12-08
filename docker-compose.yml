@@ -1,7 +1,39 @@
 services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:23.12
+    container_name: clickhouse
+    restart: unless-stopped
+    environment:
+      CLICKHOUSE_DB: ${CLICKHOUSE_DB:-starlink}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-starlink}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-change_me}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+      - clickhouse-logs:/var/log/clickhouse-server
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: ["CMD-SHELL", "clickhouse-client --host 127.0.0.1 --query 'SELECT 1'"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    ports:
+      - "8123:8123"  # HTTP interface
+      - "9000:9000"  # Native TCP client (optional)
+
   starlink-telemetry:
     image: itsmrrobot/starlink-telemetry:latest
     container_name: starlink-telemetry
     restart: always
     env_file:
       - .env  # Config here
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+
+volumes:
+  clickhouse-data:
+  clickhouse-logs:
