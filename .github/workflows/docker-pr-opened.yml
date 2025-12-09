@@ -1,7 +1,8 @@
-name: Production - Build and Push Docker Image
+name: PR - Build Docker Image
 
 on:
-  push:
+  pull_request:
+    types: [opened]
     branches:
       - main
     paths:
@@ -11,6 +12,7 @@ on:
       - requirements.txt
       - .env
       - .github/workflows/docker-push-main.yml
+      - .github/workflows/docker-pr-build.yml
 
 env:
   IMAGE_NAME: itsmrrobot/starlink-telemetry
@@ -28,17 +30,10 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Log in to Docker Hub
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Build and push
+      - name: Build (no push)
         uses: docker/build-push-action@v5
         with:
           context: .
           file: ${{ env.DOCKERFILE_PATH }}
-          push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-          tags: ${{ env.IMAGE_NAME }}:latest
+          push: false
+          tags: ${{ env.IMAGE_NAME }}:pr-build
