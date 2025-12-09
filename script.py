@@ -230,6 +230,8 @@ def build_rows(telemetry, column_names_by_type, device_type_names, alert_names_b
                 continue
             if key == 'H3CellId':
                 lat_lon = h3_to_lat_lon(value)
+                # Do not store the raw H3 cell in metrics/info; only derived lat/lon.
+                continue
             numeric_val = to_float(cleaned_value)
             if numeric_val is not None:
                 metrics[key] = numeric_val
