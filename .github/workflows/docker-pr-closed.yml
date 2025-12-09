@@ -1,16 +1,17 @@
-name: Development - Build and Push Docker Image
+name: Production - Build and Push Docker Image
 
 on:
-  push:
+  pull_request:
+    types: [closed]
     branches:
-      - dev
+      - main
     paths:
       - script.py
       - docker-compose.yml
       - Docker/Dockerfile
       - requirements.txt
       - .env
-      - .github/workflows/docker-push-dev.yml
+      - .github/workflows/docker-push-main.yml
 
 env:
   IMAGE_NAME: itsmrrobot/starlink-telemetry
@@ -18,6 +19,7 @@ env:
 
 jobs:
   docker:
+    if: github.event.pull_request.merged == true
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -29,7 +31,7 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Log in to Docker Hub
-        if: github.event_name == 'push' && github.ref == 'refs/heads/dev'
+        if: github.event.pull_request.merged == true && github.event.pull_request.base.ref == 'main'
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
@@ -40,5 +42,5 @@ jobs:
         with:
           context: .
           file: ${{ env.DOCKERFILE_PATH }}
-          push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
-          tags: ${{ env.IMAGE_NAME }}:dev
+          push: ${{ github.event.pull_request.merged == true && github.event.pull_request.base.ref == 'main' }}
+          tags: ${{ env.IMAGE_NAME }}:latest

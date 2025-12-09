@@ -1,54 +1,33 @@
-import requests
+import json
 import os
-import threading
 import time
-import re
-from http.server import BaseHTTPRequestHandler, HTTPServer
+import requests
+try:
+    import h3
+    H3_AVAILABLE = True
+except ImportError:
+    H3_AVAILABLE = False
+H3_WARNING_EMITTED = False
 from dotenv import load_dotenv
 
 load_dotenv()
 
 CLIENT_ID = os.getenv('CLIENT_ID')
 CLIENT_SECRET = os.getenv('CLIENT_SECRET')
+BATCH_SIZE = int(os.getenv('BATCH_SIZE', '1000'))
+MAX_LINGER = int(os.getenv('MAX_LINGER', '15000'))
 
-BATCH_SIZE = os.getenv('BATCH_SIZE')
-MAX_LINGER = os.getenv('MAX_LINGER')
-METRICS_PORT = int(os.getenv('METRICS_PORT', '9100'))
+CLICKHOUSE_URL = os.getenv('CLICKHOUSE_URL')
+CLICKHOUSE_USER = os.getenv('CLICKHOUSE_USER', 'default')
+CLICKHOUSE_PASSWORD = os.getenv('CLICKHOUSE_PASSWORD', '')
+CLICKHOUSE_DB = os.getenv('CLICKHOUSE_DB', 'default')
 
-required_vars = ['CLIENT_ID', 'CLIENT_SECRET', 'BATCH_SIZE', 'MAX_LINGER']
+required_vars = ['CLIENT_ID', 'CLIENT_SECRET', 'CLICKHOUSE_URL']
 for var in required_vars:
     if not os.getenv(var):
         raise RuntimeError(f"Missing required environment variable: {var}")
 
-# Shared buffer for latest Prometheus-formatted lines.
-latest_lines = []
-latest_lock = threading.Lock()
 ALERT_FIELDS = ('Alerts', 'ActiveAlerts', 'ActiveAlertIds')
-
-class MetricsHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        if self.path != "/metrics":
-            self.send_response(404)
-            self.end_headers()
-            return
-
-        with latest_lock:
-            body = "\n".join(latest_lines) + "\n" if latest_lines else "# no data yet\n"
-
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-        self.end_headers()
-        self.wfile.write(body.encode("utf-8"))
-
-    def log_message(self, format, *args):
-        # Silence default logging to avoid noisy stdout.
-        return
-
-def start_http_server(port):
-    server = HTTPServer(("0.0.0.0", port), MetricsHandler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    return server
 
 def get_starlink_access_token():
     return requests.post(
@@ -60,22 +39,6 @@ def get_starlink_access_token():
                 'grant_type' : 'client_credentials'
             }
     ).json()['access_token']
-
-def get_column_index(column_names, desired_column_name):
-    """
-    Gets the index for a telemtry metric (ex: ObstructionPercentTime).
-
-    :param column_names: column names for a specific device type.
-    :param desired_column_name: column you want to get index of (ex: ObstructionPercentTime).
-    :return: index of the metric, or -1 if it can not be found.
-    """
-    index = 0
-    for column_name in column_names:
-        if column_name == desired_column_name:
-            return index
-        index += 1
-
-    return -1
 
 def map_entry_to_record(entry, columns):
     """
@@ -106,123 +69,212 @@ def extract_alert_codes(record):
                 return [str(val)]
     return []
 
-def sanitize_label_value(value):
-    """
-    Simplistic label sanitization for Prometheus-friendly output.
-    """
-    return str(value).replace('\\', '\\\\').replace('\n', '\\n').replace('"', '\\"')
-
-def sanitize_metric_name(name):
-    """
-    Convert field names to Prometheus-safe metric identifiers.
-    """
-    return re.sub(r'[^a-zA-Z0-9_:]', '_', name)
-
 def to_float(value):
     try:
         return float(value)
     except (ValueError, TypeError):
         return None
 
-def format_line_protocol(record, device_type_names, ip_lookup):
+def normalize_device_id(device_type_code, device_id):
+    if device_type_code == 'i' and isinstance(device_id, str) and device_id.startswith("ip-"):
+        return device_id[3:]
+    return device_id
+
+def h3_to_lat_lon(cell_value):
     """
-    Convert a telemetry record into Prometheus exposition lines.
-    Router records are ignored upstream; this function focuses on final formatting.
+    Convert H3 cell id to (lat, lon). Returns None if conversion fails or h3 is unavailable.
     """
-    device_type_code = record.get('DeviceType')
-    device_type_label = device_type_names.get(device_type_code, device_type_code)
-    device_id = record.get('DeviceId')
-    timestamp = record.get('UtcTimestampNs')
-
-    if timestamp is None or device_id is None:
-        return []
-
-    ts_ms = int(timestamp / 1_000_000)
-
-    numeric_metrics = []
-    info_labels = {}
-
-    # Start with the fields present on the record itself.
-    for key, value in record.items():
-        if key in {'DeviceType', 'UtcTimestampNs', 'DeviceId'}:
-            continue
-        if key in ALERT_FIELDS:
-            continue
-        cleaned_value = clean_field_value(value)
-        if cleaned_value is None or cleaned_value == '':
-            continue
-
-        numeric_val = to_float(cleaned_value)
-        if numeric_val is not None:
-            metric_name = sanitize_metric_name(f"starlink_{key}")
-            numeric_metrics.append((metric_name, numeric_val))
+    global H3_WARNING_EMITTED
+    if not H3_AVAILABLE:
+        if not H3_WARNING_EMITTED:
+            print("h3 library not available; cannot derive latitude/longitude from H3CellId", flush=True)
+            H3_WARNING_EMITTED = True
+        return None
+    if cell_value in (None, ''):
+        return None
+    try:
+        if isinstance(cell_value, int):
+            cell_str = hex(cell_value)
         else:
-            info_labels[sanitize_metric_name(key.lower())] = str(cleaned_value)
+            # Accept both hex string and plain string; convert digits to int->hex for safety.
+            if isinstance(cell_value, str) and cell_value.isdigit():
+                cell_str = hex(int(cell_value))
+            else:
+                cell_str = str(cell_value)
+        lat, lon = h3.cell_to_latlng(cell_str)
+        return lat, lon
+    except Exception:
+        return None
 
-    # Merge IP allocation data onto non-IP allocation records when device IDs match.
-    if device_type_code != 'i':
-        ip_record = ip_lookup.get(device_id)
-        if ip_record:
-            for key in ('Ipv4', 'Ipv6Ue', 'Ipv6Cpe'):
-                cleaned_value = clean_field_value(ip_record.get(key))
-                if cleaned_value:
-                    info_labels[sanitize_metric_name(key.lower())] = str(cleaned_value)
-
-    if not numeric_metrics and not info_labels:
-        return []
-
-    base_labels = {
-        'device_type': device_type_label,
-        'deviceID': device_id
-    }
-
-    lines = []
-
-    # Numeric metrics emitted individually.
-    for metric_name, value in numeric_metrics:
-        label_str = ",".join(f'{k}="{sanitize_label_value(v)}"' for k, v in base_labels.items())
-        lines.append(f"{metric_name}{{{label_str}}} {value} {ts_ms}")
-
-    # Info metric for string/list fields.
-    if info_labels:
-        merged_labels = {**base_labels, **info_labels}
-        label_str = ",".join(f'{k}="{sanitize_label_value(v)}"' for k, v in merged_labels.items())
-        lines.append(f"starlink_info{{{label_str}}} 1 {ts_ms}")
-
-    return lines
-
-def format_alert_lines(record, device_type_names, alert_names_by_device):
-    """
-    Generate alert lines for a single record if active alerts exist.
-    """
-    device_type_code = record.get('DeviceType')
-    if device_type_code != 'u':  # Only UserTerminal alerts are emitted.
-        return []
-
-    timestamp = record.get('UtcTimestampNs')
-    device_id = record.get('DeviceId')
-    if timestamp is None or device_id is None:
-        return []
-
-    alert_codes = extract_alert_codes(record)
-    if not alert_codes:
-        return []
-
-    device_type_label = device_type_names.get(device_type_code, device_type_code)
-    alert_name_map = alert_names_by_device.get(device_type_code, {})
-
-    lines = []
-    for code in alert_codes:
-        alert_name = alert_name_map.get(code, code)
-        label_str = ",".join(
-            [
-                f'device_type="{sanitize_label_value(device_type_label)}"',
-                f'deviceID="{sanitize_label_value(device_id)}"',
-                f'alert="{sanitize_label_value(alert_name)}"'
-            ]
+def ensure_tables():
+    ddl_statements = [
+        f"""
+        CREATE TABLE IF NOT EXISTS {CLICKHOUSE_DB}.telemetry
+        (
+            device_type String,
+            device_id String,
+            ts_ns UInt64,
+            metrics Map(String, Float64),
+            info Map(String, String)
         )
-        lines.append(f"starlink_alert_active{{{label_str}}} 1 {int(timestamp/1_000_000)}")
-    return lines
+        ENGINE = MergeTree
+        ORDER BY (device_id, ts_ns)
+        """,
+        f"""
+        CREATE TABLE IF NOT EXISTS {CLICKHOUSE_DB}.alerts
+        (
+            device_type String,
+            device_id String,
+            ts_ns UInt64,
+            alert_name String
+        )
+        ENGINE = MergeTree
+        ORDER BY (device_id, ts_ns)
+        """,
+        f"""
+        CREATE TABLE IF NOT EXISTS {CLICKHOUSE_DB}.ip_allocations
+        (
+            device_id String,
+            ts_ns UInt64,
+            ipv4 Array(String),
+            ipv6_ue Array(String),
+            ipv6_cpe Array(String)
+        )
+        ENGINE = MergeTree
+        ORDER BY (device_id, ts_ns)
+        """
+    ]
+    for ddl in ddl_statements:
+        execute_clickhouse_query(ddl)
+
+def execute_clickhouse_query(query):
+    backoff = 1
+    while True:
+        try:
+            resp = requests.post(
+                CLICKHOUSE_URL,
+                params={'query': query},
+                auth=(CLICKHOUSE_USER, CLICKHOUSE_PASSWORD),
+                timeout=20,
+            )
+            if resp.status_code == 200:
+                return
+            else:
+                print(f"ClickHouse query failed ({resp.status_code}): {resp.text}", flush=True)
+        except requests.RequestException as exc:
+            print(f"ClickHouse request error: {exc}", flush=True)
+        time.sleep(backoff)
+        backoff = min(backoff * 2, 60)
+
+def insert_json_rows(table, rows):
+    if not rows:
+        return
+    query = f"INSERT INTO {CLICKHOUSE_DB}.{table} FORMAT JSONEachRow"
+    payload = "\n".join(json.dumps(row, ensure_ascii=False) for row in rows)
+    backoff = 1
+    while True:
+        try:
+            resp = requests.post(
+                CLICKHOUSE_URL,
+                params={'query': query},
+                data=payload.encode('utf-8'),
+                auth=(CLICKHOUSE_USER, CLICKHOUSE_PASSWORD),
+                timeout=20,
+            )
+            if resp.status_code == 200:
+                return
+            else:
+                print(f"Insert to {table} failed ({resp.status_code}): {resp.text}", flush=True)
+        except requests.RequestException as exc:
+            print(f"Insert to {table} request error: {exc}", flush=True)
+        time.sleep(backoff)
+        backoff = min(backoff * 2, 60)
+
+def build_rows(telemetry, column_names_by_type, device_type_names, alert_names_by_device):
+    telemetry_rows = []
+    alert_rows = []
+    ip_rows = []
+
+    for entry in telemetry:
+        if not entry or entry[0] == 'r':
+            continue
+
+        device_type_code = entry[0]
+        columns = column_names_by_type.get(device_type_code)
+        if not columns:
+            continue
+
+        record = map_entry_to_record(entry, columns)
+        device_id_raw = record.get('DeviceId')
+        device_id = normalize_device_id(device_type_code, device_id_raw)
+        ts_ns = record.get('UtcTimestampNs')
+        if device_id is None or ts_ns is None:
+            continue
+
+        if device_type_code == 'i':
+            ipv4 = record.get('Ipv4') if isinstance(record.get('Ipv4'), list) else ([] if record.get('Ipv4') is None else [record.get('Ipv4')])
+            ipv6_ue = record.get('Ipv6Ue') if isinstance(record.get('Ipv6Ue'), list) else ([] if record.get('Ipv6Ue') is None else [record.get('Ipv6Ue')])
+            ipv6_cpe = record.get('Ipv6Cpe') if isinstance(record.get('Ipv6Cpe'), list) else ([] if record.get('Ipv6Cpe') is None else [record.get('Ipv6Cpe')])
+            ip_rows.append(
+                {
+                    "device_id": device_id,
+                    "ts_ns": int(ts_ns),
+                    "ipv4": [str(v) for v in ipv4],
+                    "ipv6_ue": [str(v) for v in ipv6_ue],
+                    "ipv6_cpe": [str(v) for v in ipv6_cpe],
+                }
+            )
+            continue
+
+        metrics = {}
+        info = {}
+        lat_lon = None
+        for key, value in record.items():
+            if key in {'DeviceType', 'UtcTimestampNs', 'DeviceId'} or key in ALERT_FIELDS:
+                continue
+            cleaned_value = clean_field_value(value)
+            if cleaned_value is None or cleaned_value == '':
+                continue
+            if key.lower() == 'h3cellid':
+                lat_lon = h3_to_lat_lon(value)
+                # Do not store the raw H3 cell in metrics/info; only derived lat/lon.
+                continue
+            numeric_val = to_float(cleaned_value)
+            if numeric_val is not None:
+                metrics[key] = numeric_val
+            else:
+                info[key] = str(cleaned_value)
+
+        if lat_lon:
+            info['latitude'] = str(lat_lon[0])
+            info['longitude'] = str(lat_lon[1])
+
+        telemetry_rows.append(
+            {
+                "device_type": device_type_names.get(device_type_code, device_type_code),
+                "device_id": device_id,
+                "ts_ns": int(ts_ns),
+                "metrics": metrics,
+                "info": info,
+            }
+        )
+
+        if device_type_code == 'u':
+            alert_codes = extract_alert_codes(record)
+            if alert_codes:
+                alert_name_map = alert_names_by_device.get(device_type_code, {})
+                for code in alert_codes:
+                    alert_name = alert_name_map.get(code, code)
+                    alert_rows.append(
+                        {
+                            "device_type": device_type_names.get(device_type_code, device_type_code),
+                            "device_id": device_id,
+                            "ts_ns": int(ts_ns),
+                            "alert_name": alert_name,
+                        }
+                    )
+
+    return telemetry_rows, alert_rows, ip_rows
 
 def poll_stream():
     """
@@ -230,9 +282,9 @@ def poll_stream():
     When called initially, you might receive a response more often as the stream catches up.
     """
     access_token = get_starlink_access_token()
-    start_http_server(METRICS_PORT)
+    ensure_tables()
 
-    while (True):
+    while True:
         start_time = time.time()
         response = requests.post(
             'https://starlink.com/api/public/v2/telemetry/stream',
@@ -249,64 +301,37 @@ def poll_stream():
                 }
         )
 
-        if (response.status_code != 200):
+        if response.status_code != 200:
             # Auth token expires ~15 minutes, so refresh it if invalid response.
             access_token = get_starlink_access_token()
-        else:
-            response_json = response.json()
+            continue
 
-            # The raw telemetry data points for all device types.
-            telemetry = response_json['data']['values']
+        response_json = response.json()
 
-            # If no telemetry received, don't do any processing.
-            if (len(telemetry) == 0):
-                continue
+        data_section = response_json.get('data', {})
+        telemetry = data_section.get('values', [])
 
-            column_names_by_type = response_json['data']['columnNamesByDeviceType']
-            device_type_names = response_json.get('metadata', {}).get('enums', {}).get('DeviceType', {})
-            alert_names_by_device = response_json.get('metadata', {}).get('enums', {}).get('AlertsByDeviceType', {})
+        if len(telemetry) == 0:
+            continue
 
-            ip_lookup = {}
-            records = []
+        column_names_by_type = data_section.get('columnNamesByDeviceType', {})
+        device_type_names = response_json.get('metadata', {}).get('enums', {}).get('DeviceType', {})
+        alert_names_by_device = response_json.get('metadata', {}).get('enums', {}).get('AlertsByDeviceType', {})
 
-            # Map telemetry entries to records keyed by column names, ignoring routers.
-            for entry in telemetry:
-                if not entry or entry[0] == 'r':
-                    continue
+        telemetry_rows, alert_rows, ip_rows = build_rows(
+            telemetry,
+            column_names_by_type,
+            device_type_names,
+            alert_names_by_device
+        )
 
-                device_type_code = entry[0]
-                columns = column_names_by_type.get(device_type_code)
-                if not columns:
-                    continue
+        insert_json_rows('telemetry', telemetry_rows)
+        insert_json_rows('alerts', alert_rows)
+        insert_json_rows('ip_allocations', ip_rows)
 
-                record = map_entry_to_record(entry, columns)
-                records.append(record)
-
-                if device_type_code == 'i':
-                    device_id = record.get('DeviceId')
-                    if device_id:
-                        ip_lookup[device_id] = record
-
-            # Emit Prometheus-friendly lines.
-            collected_lines = []
-            for record in records:
-                lines = format_line_protocol(record, device_type_names, ip_lookup)
-                for line in lines:
-                    print(line, flush=True)
-                collected_lines.extend(lines)
-
-                # Emit alerts if present for user terminals.
-                alert_lines = format_alert_lines(record, device_type_names, alert_names_by_device)
-                for alert_line in alert_lines:
-                    print(alert_line, flush=True)
-                collected_lines.extend(alert_lines)
-
-            with latest_lock:
-                latest_lines[:] = collected_lines
-            
-            elapsed_time = time.time() - start_time
-            sleep_duration = max(0, 15 - elapsed_time)
-            time.sleep(sleep_duration)
+        elapsed_time = time.time() - start_time
+        sleep_duration = max(0, 15 - elapsed_time)
+        time.sleep(sleep_duration)
 
 if __name__ == '__main__':
     poll_stream()
