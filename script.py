@@ -7,6 +7,7 @@ try:
     H3_AVAILABLE = True
 except ImportError:
     H3_AVAILABLE = False
+H3_WARNING_EMITTED = False
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -83,7 +84,13 @@ def h3_to_lat_lon(cell_value):
     """
     Convert H3 cell id to (lat, lon). Returns None if conversion fails or h3 is unavailable.
     """
-    if not H3_AVAILABLE or cell_value in (None, ''):
+    global H3_WARNING_EMITTED
+    if not H3_AVAILABLE:
+        if not H3_WARNING_EMITTED:
+            print("h3 library not available; cannot derive latitude/longitude from H3CellId", flush=True)
+            H3_WARNING_EMITTED = True
+        return None
+    if cell_value in (None, ''):
         return None
     try:
         if isinstance(cell_value, int):
@@ -228,7 +235,7 @@ def build_rows(telemetry, column_names_by_type, device_type_names, alert_names_b
             cleaned_value = clean_field_value(value)
             if cleaned_value is None or cleaned_value == '':
                 continue
-            if key == 'H3CellId':
+            if key.lower() == 'h3cellid':
                 lat_lon = h3_to_lat_lon(value)
                 # Do not store the raw H3 cell in metrics/info; only derived lat/lon.
                 continue
